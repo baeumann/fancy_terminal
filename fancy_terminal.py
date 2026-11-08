@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QFont, QTextCursor, QColor, QTextCharFormat, QPainter, QPen,
-    QImage, QBrush, QLinearGradient
+    QImage, QBrush, QLinearGradient, QPainterPath
 )
 
 
@@ -157,17 +157,17 @@ class TitleBar(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Voxel ripple
+#  Voxel ripple — perfectly unified, subtle, faster
 # ─────────────────────────────────────────────────────────────
 class VoxelRipple(QWidget):
-    BLUR_SCALE     = 2
-    WAKE_DECAY     = 0.55
-    WAKE_STRENGTH  = 0.65
-    EDGE_SHARPNESS = 1.6
-    EDGE_BOOST     = 0.55
-    WAVE_VARIANCE  = 0.10
-    TRAVEL_DIM     = 0.65
-    FADE_RATE      = 0.06
+    BLUR_SCALE      = 2
+    WAKE_DECAY      = 0.45
+    WAKE_STRENGTH   = 0.12  # Much dimmer
+    EDGE_SHARPNESS  = 1.4
+    EDGE_BOOST      = 0.20  # Much dimmer
+    WAVE_VARIANCE   = 0.10
+    TRAVEL_DIM      = 0.72
+    FADE_RATE       = 0.09
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -178,7 +178,12 @@ class VoxelRipple(QWidget):
         self._life = 1.0; self._travel_life = 1.0
         self._cell = 10; self._speed = 20.0
         self._color = QColor(0, 235, 215)
+        self._clip_radius = 12
         self._t = QTimer(self); self._t.timeout.connect(self._step)
+
+    def set_clip_radius(self, r):
+        self._clip_radius = max(0, int(r))
+        self.update()
 
     def spawn(self, x, y, cell, color=(0, 235, 215)):
         self._origin = QPointF(x, y); self._radius = 0.0
@@ -186,7 +191,8 @@ class VoxelRipple(QWidget):
         w, h = max(1, self.width()), max(1, self.height())
         self._max_r = max(math.hypot(cx-x, cy-y)
                           for cx, cy in [(0,0),(w,0),(0,h),(w,h)])
-        self._speed = max(14.0, self._max_r / 55.0)
+        # Much faster expansion
+        self._speed = max(22.0, self._max_r / 28.0)
         self._life = 1.0; self._travel_life = 1.0
         self._color = QColor(*color); self._active = True
         if not self._t.isActive(): self._t.start(16)
@@ -246,13 +252,17 @@ class VoxelRipple(QWidget):
                     rand = (h & 0x7FFFFFFF) / 0x7FFFFFFF
                     inten *= (1.0 - var_half + var * rand)
                     if inten < 0.04: continue
-                    alpha = int(inten * 250)
+                    alpha = int(inten * 200)  # Softened alpha (was 250)
                     if alpha > 255: alpha = 255
                     ip.setBrush(QColor(cr, cg, cb, alpha))
                     ip.drawRect(int(col*cs), int(row*cs), cs_int, cs_int)
 
         with QPainter(self) as p:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            if self._clip_radius > 0:
+                path = QPainterPath()
+                path.addRoundedRect(QRectF(self.rect()), self._clip_radius, self._clip_radius)
+                p.setClipPath(path)
             p.drawImage(self.rect(), img)
 
 
@@ -270,9 +280,9 @@ class GlowInput(QLineEdit):
         super().paintEvent(ev)
         if not self.hasFocus(): return
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        alpha = int(55 + 35*(0.5 + 0.5*math.sin(self._phase)))
+        alpha = int(45 + 30*(0.5 + 0.5*math.sin(self._phase)))
         p.setPen(QPen(QColor(0,220,210,alpha), 1.0)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5,0.5,-0.5,-0.5), 5, 5)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5,0.5,-0.5,-0.5), 4, 4)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -284,10 +294,16 @@ class SmoothBar(QProgressBar):
         self.setTextVisible(False); self.setRange(0, 100); self.setFixedHeight(12)
         self._val = 0.0; self._target = 0.0
         self.setStyleSheet("""
-            QProgressBar { background:#0a0c10; border:1px solid #16181e; border-radius:6px; }
-            QProgressBar::chunk { border-radius:5px;
+            QProgressBar {
+                background: rgba(10, 11, 13, 100);
+                border: none;
+                border-radius: 6px;
+            }
+            QProgressBar::chunk {
+                border-radius: 6px;
                 background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 #00d9c8, stop:1 #8060d0); }
+                    stop:0 #00d9c8, stop:1 #8060d0);
+            }
         """)
         self._label = QLabel(name)
         self._label.setStyleSheet("color:#4f5a66; font-family:Consolas; font-size:10px; background:transparent;")
@@ -343,7 +359,7 @@ class ShellWorker(QThread):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Typewriter
+#  Typewriter (no outline)
 # ─────────────────────────────────────────────────────────────
 class Typewriter:
     def __init__(self, te: QTextEdit):
@@ -372,7 +388,8 @@ class Typewriter:
         cursor = self.te.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         for text, color in runs:
-            fmt = QTextCharFormat(); fmt.setForeground(QColor(color))
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
             cursor.insertText(text, fmt)
         self.te.setTextCursor(cursor); self.te.ensureCursorVisible()
 
@@ -389,7 +406,8 @@ class FancyTerminal(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fancy Terminal")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        # NoDropShadowWindowHint prevents the Windows 11 1px border outline
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(1000, 700)
         self.setMouseTracking(True)
@@ -422,25 +440,27 @@ class FancyTerminal(QWidget):
 
         content = QWidget(); content.setStyleSheet("background:transparent;")
         c = QVBoxLayout(content)
-        c.setContentsMargins(14, 8, 14, 12); c.setSpacing(8)
+        c.setContentsMargins(14, 6, 14, 10); c.setSpacing(6)
         inner.addWidget(content, stretch=1)
 
+        # Output — transparent
         self.out = QTextEdit(); self.out.setReadOnly(True)
         self.out.setFont(QFont("Consolas", 11))
         self.out.setStyleSheet("""
             QTextEdit {
-                background:#060709; color:#b8c8d4;
-                border:1px solid #14161a; border-radius:6px;
-                padding:10px;
+                background: transparent;
+                color: #c8d8e4;
+                border: none;
+                padding: 4px 2px;
             }
             QScrollBar:vertical { background:transparent; width:8px; border:none; margin:0; }
-            QScrollBar::handle:vertical { background:#1a1f26; min-height:24px; border-radius:4px; }
-            QScrollBar::handle:vertical:hover { background:#28303a; }
+            QScrollBar::handle:vertical { background: rgba(40, 48, 58, 180); min-height:24px; border-radius:4px; }
+            QScrollBar::handle:vertical:hover { background: rgba(58, 70, 84, 220); }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; background:none; border:none; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:none; }
             QScrollBar:horizontal { background:transparent; height:8px; border:none; margin:0; }
-            QScrollBar::handle:horizontal { background:#1a1f26; min-width:24px; border-radius:4px; }
-            QScrollBar::handle:horizontal:hover { background:#28303a; }
+            QScrollBar::handle:horizontal { background: rgba(40, 48, 58, 180); min-width:24px; border-radius:4px; }
+            QScrollBar::handle:horizontal:hover { background: rgba(58, 70, 84, 220); }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; background:none; border:none; }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:none; }
         """)
@@ -450,7 +470,7 @@ class FancyTerminal(QWidget):
         c.addLayout(self.prog_box)
         self.progress = ProgressGroup(self.prog_box)
 
-        irow = QHBoxLayout(); irow.setSpacing(8)
+        irow = QHBoxLayout(); irow.setSpacing(6)
         prompt = QLabel("λ")
         prompt.setStyleSheet("color:#00d9c8; font-family:Consolas; font-size:14px; background:transparent;")
         prompt.setFixedWidth(14)
@@ -458,10 +478,12 @@ class FancyTerminal(QWidget):
         self.input.setPlaceholderText("type a command...")
         self.input.setStyleSheet("""
             QLineEdit {
-                background:#060709; color:#d0dde6;
-                border:1px solid #14161a; border-radius:5px;
-                padding:8px 10px;
-                selection-background-color:#00d9c8; selection-color:#08090c;
+                background: transparent;
+                color: #d0dde6;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 8px;
+                selection-background-color: #00d9c8; selection-color: #08090c;
             }
         """)
         self.input.returnPressed.connect(self._submit)
@@ -470,7 +492,9 @@ class FancyTerminal(QWidget):
         c.addLayout(irow)
 
         self.wave = VoxelRipple(self._container)
-        self.wave.setGeometry(self._container.rect()); self.wave.raise_()
+        self.wave.setGeometry(self._container.rect())
+        self.wave.set_clip_radius(self.RADIUS)
+        self.wave.lower()
         self._container.installEventFilter(self)
 
         self.setStyleSheet("QLabel { color:#b8c8d4; background:transparent; }")
@@ -488,6 +512,10 @@ class FancyTerminal(QWidget):
 
         self._write_welcome()
         self._apply_shape()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     # --- system-stats helpers ---
     def _greeting(self):
@@ -603,18 +631,30 @@ class FancyTerminal(QWidget):
     # --- paint & shape ---
     def paintEvent(self, ev):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 8))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        if self.isMaximized() or self.isFullScreen():
+            path.addRect(QRectF(self.rect()))
+        else:
+            path.addRoundedRect(QRectF(self.rect()), self.RADIUS + self.RESIZE_MARGIN, self.RADIUS + self.RESIZE_MARGIN)
+        p.fillPath(path, QColor(0, 0, 0, 1))
 
     def _apply_shape(self):
         if self.isMaximized() or self.isFullScreen():
             self._outer.setContentsMargins(0, 0, 0, 0)
             self._container.setStyleSheet(
-                "QWidget#container { background:#0a0b0d; border-radius:0px; }")
+                "QWidget#container { background:#0a0b0d; border:none; border-radius:0px; }")
+            if hasattr(self, "wave"):
+                self.wave.set_clip_radius(0)
+                self.wave.lower()
         else:
             m = self.RESIZE_MARGIN
             self._outer.setContentsMargins(m, m, m, m)
             self._container.setStyleSheet(
-                "QWidget#container { background:#0a0b0d; border-radius:%dpx; }" % self.RADIUS)
+                "QWidget#container { background:#0a0b0d; border:none; border-radius:%dpx; }" % self.RADIUS)
+            if hasattr(self, "wave"):
+                self.wave.set_clip_radius(self.RADIUS)
+                self.wave.lower()
 
     def _update_cwd_label(self):
         home = os.path.expanduser("~"); p = self._cwd
@@ -628,7 +668,8 @@ class FancyTerminal(QWidget):
             self._apply_shape(); QTimer.singleShot(0, self._sync_wave)
     def _sync_wave(self):
         if hasattr(self, "wave"):
-            self.wave.setGeometry(self._container.rect()); self.wave.raise_()
+            self.wave.setGeometry(self._container.rect())
+            self.wave.lower()
 
     # --- resize ---
     def _edge_at(self, pos, expanded=False):
@@ -735,8 +776,15 @@ class FancyTerminal(QWidget):
             n /= 1024
         return f"{n:.0f}P"
 
-    # --- keyboard ---
+    # --- keyboard / event filter ---
     def eventFilter(self, obj, ev):
+        if ev.type() == ev.Type.MouseButtonPress and isinstance(obj, QWidget):
+            try:
+                if obj.window() is self and obj is not self.input and obj is not self.wave:
+                    self.input.setFocus()
+            except Exception:
+                pass
+
         if obj is self._container:
             if ev.type() == ev.Type.Resize:
                 self._sync_wave()
@@ -908,7 +956,7 @@ class FancyTerminal(QWidget):
         last_word = trimmed if sp == -1 else trimmed[sp+1:]
         prefix_w = 0 if sp == -1 else fm.horizontalAdvance(raw[:sp+1])
         if last_word and self.wave.width() > 0:
-            wx = 10 + prefix_w; ww = fm.horizontalAdvance(last_word)
+            wx = 8 + prefix_w; ww = fm.horizontalAdvance(last_word)
             cell = max(8, min(16, fm.horizontalAdvance('M')))
             gp = self.input.mapToGlobal(QPoint(int(wx + ww/2), int(self.input.height()/2)))
             lp = self.wave.mapFromGlobal(gp)
