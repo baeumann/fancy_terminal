@@ -283,3 +283,11 @@ MIT — see [LICENSE](LICENSE).
 ## Credits
 
 Built with **PyQt6**. Inspired by iTerm2, Windows Terminal, and the pixel-grid aesthetic of early demoscene intros.
+
+
+Building instructions:
+python -m nuitka --standalone --onefile --windows-console-mode=disable --enable-plugin=pyqt6 --nofollow-import-to=psutil --include-package=psutil fancy_terminal.py
+
+or
+
+pyinstaller --onefile fancy_terminal.py
