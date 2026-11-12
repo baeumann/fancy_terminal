@@ -1,5 +1,5 @@
 import sys, os, subprocess, math, traceback, re, time, shutil, platform, getpass
-import glob, datetime, fnmatch, warnings
+import glob, datetime, fnmatch, warnings, stat, codecs, signal, threading
 warnings.filterwarnings("ignore", message=r".*sipPyTypeDict.*")
 from collections import deque
 from PyQt6.QtWidgets import (
@@ -7,11 +7,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QProgressBar, QLabel
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, pyqtSignal, QThread, QObject, QPointF, QPoint, QRect, QRectF
+    Qt, QTimer, pyqtSignal, QThread, QObject, QPointF, QPoint, QRect, QRectF, QEvent
 )
 from PyQt6.QtGui import (
-    QFont, QTextCursor, QColor, QTextCharFormat, QPainter, QPen,
-    QImage, QBrush, QLinearGradient, QPainterPath
+    QFont, QTextCursor, QColor, QTextCharFormat, QTextBlockFormat, QPainter, QPen,
+    QBrush, QLinearGradient, QRadialGradient, QPainterPath
 )
 
 
@@ -23,15 +23,37 @@ ASCII_LOGO = (
 
 
 # ─────────────────────────────────────────────────────────────
-#  ANSI
+#  Qt-free helpers: colour maths, ANSI stream, column layout,
+#  ripple maths.  (No Qt in here, so it can be unit-tested.)
 # ─────────────────────────────────────────────────────────────
+TEAL   = (0, 217, 200)
+VIOLET = (128, 96, 208)
+BG_HEX = "#0a0b0d"
+
+def _lerp_rgb(a, b, t):
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
+
+def _rgb(h):
+    h = h.lstrip('#')
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+def _mix_hex(a, b, t):
+    return _hex(_lerp_rgb(_rgb(a), _rgb(b), t))
+
+
+# --- ANSI -------------------------------------------------------------------
 _ANSI_SGR   = re.compile(r'\x1b\[([0-9;]*)m')
 _ANSI_OTHER = re.compile(r'\x1b\[[0-9;?]*[a-ln-zA-LN-Z]')
 _ANSI_OSC   = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
 _ANSI_MISC  = re.compile(r'\x1b[()][A-Za-z0-9]|\x1b[=>]')
-_PALETTE = ["#1c1c1c","#cc5555","#55cc55","#cccc55","#5577cc","#cc55cc",
-            "#55cccc","#c0c0c0","#4a4a4a","#ff7777","#77ff77","#ffff77",
-            "#7799ff","#ff77ff","#77ffff","#ffffff"]
+_ANSI_TAIL  = re.compile(r'\x1b(?:\[[0-9;?]*|\][^\x07\x1b]*)?\Z')   # escape cut off at chunk end
+_CTRL       = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')       # everything but \t \n \r
+_PALETTE = ["#3a4450", "#e05a6a", "#5fd68a", "#e0b050", "#5a9fd0", "#b08cf0",
+            "#00d9c8", "#c0ccd6", "#4f5a66", "#ff7a8a", "#86efac", "#f5cc6a",
+            "#7ab8e8", "#c9a8ff", "#4ff0e0", "#f2f7fa"]
 
 def _ansi256(n):
     if n < 16:  return _PALETTE[n]
@@ -41,45 +63,132 @@ def _ansi256(n):
     v = (n - 232) * 10 + 8
     return f"#{v:02x}{v:02x}{v:02x}"
 
-def _strip_other(t):
-    t = _ANSI_OSC.sub('', t); t = _ANSI_MISC.sub('', t); t = _ANSI_OTHER.sub('', t)
-    return t
 
-def parse_ansi(text, default_color):
-    if '\x1b' not in text:
-        if text: yield (text, default_color)
-        return
-    text = _strip_other(text)
-    pos, current = 0, default_color
-    for m in _ANSI_SGR.finditer(text):
-        if m.start() > pos:
-            chunk = text[pos:m.start()]
-            if chunk: yield (chunk, current)
-        codes = (m.group(1) or '0').split(';')
+class AnsiStream:
+    """Incremental ANSI/SGR parser.
+
+    Unlike a per-line parser it keeps colour/bold/underline state across
+    chunks and lines, and holds back an escape sequence that is cut in half
+    at the end of a chunk until the rest arrives.
+    feed(text) -> [(plain_text, (color, bold, underline)), ...]
+    """
+    def __init__(self, default_color):
+        self.default = default_color
+        self.reset()
+
+    def reset(self):
+        self.color = self.default
+        self.bold = self.underline = self.dim = False
+        self._carry = ""
+
+    def _style(self):
+        c = _mix_hex(self.color, BG_HEX, 0.5) if self.dim else self.color
+        return (c, self.bold, self.underline)
+
+    def feed(self, text):
+        text = self._carry + text
+        self._carry = ""
+        m = _ANSI_TAIL.search(text)
+        if m:
+            self._carry = text[m.start():]
+            text = text[:m.start()]
+        text = text.replace('\r\n', '\n')
+        text = _ANSI_OSC.sub('', text)
+        text = _ANSI_MISC.sub('', text)
+        text = _ANSI_OTHER.sub('', text)
+        out, pos = [], 0
+        for m in _ANSI_SGR.finditer(text):
+            if m.start() > pos:
+                out.append((_CTRL.sub('', text[pos:m.start()]), self._style()))
+            self._apply(m.group(1))
+            pos = m.end()
+        if pos < len(text):
+            out.append((_CTRL.sub('', text[pos:]), self._style()))
+        return [(t, s) for t, s in out if t]
+
+    def _apply(self, params):
+        codes = params.split(';') if params else ['0']
         i = 0
         while i < len(codes):
             try: c = int(codes[i]) if codes[i] else 0
             except ValueError: i += 1; continue
-            if c == 0: current = default_color
-            elif 30 <= c <= 37: current = _PALETTE[c - 30]
-            elif 90 <= c <= 97: current = _PALETTE[c - 90 + 8]
-            elif c == 39: current = default_color
-            elif c == 38 and i + 1 < len(codes):
-                if codes[i+1] == '5' and i + 2 < len(codes):
-                    try: current = _ansi256(int(codes[i+2]))
+            if   c == 0:  self.color = self.default; self.bold = self.underline = self.dim = False
+            elif c == 1:  self.bold = True
+            elif c == 2:  self.dim = True
+            elif c == 22: self.bold = self.dim = False
+            elif c == 4:  self.underline = True
+            elif c == 24: self.underline = False
+            elif 30 <= c <= 37: self.color = _PALETTE[c - 30]
+            elif 90 <= c <= 97: self.color = _PALETTE[c - 90 + 8]
+            elif c == 39: self.color = self.default
+            elif c in (38, 48, 58):
+                mode = codes[i + 1] if i + 1 < len(codes) else ''
+                new = None
+                if mode == '5' and i + 2 < len(codes):
+                    try: new = _ansi256(int(codes[i + 2]))
                     except ValueError: pass
                     i += 2
-                elif codes[i+1] == '2' and i + 4 < len(codes):
-                    try:
-                        r,g,b = int(codes[i+2]),int(codes[i+3]),int(codes[i+4])
-                        current = f"#{r:02x}{g:02x}{b:02x}"
+                elif mode == '2' and i + 4 < len(codes):
+                    try: new = _hex((int(codes[i + 2]), int(codes[i + 3]), int(codes[i + 4])))
                     except ValueError: pass
                     i += 4
+                if c == 38 and new: self.color = new      # 48 (background) / 58 are skipped
             i += 1
-        pos = m.end()
-    if pos < len(text):
-        chunk = text[pos:]
-        if chunk: yield (chunk, current)
+
+
+# --- layout / small utils ---------------------------------------------------
+def layout_columns(widths, term_cols, gap=2):
+    """Column-major layout like `ls`. widths = label widths.
+    Returns (nrows, [column widths]); item (row r, col c) is index c*nrows + r."""
+    n = len(widths)
+    if n == 0:
+        return 0, []
+    upper = min(n, max(1, term_cols // (min(widths) + gap) + 1))
+    for ncols in range(upper, 0, -1):
+        nrows = -(-n // ncols)
+        cols = [widths[c * nrows:(c + 1) * nrows] for c in range(ncols)]
+        colw = [max(c) for c in cols if c]
+        if ncols == 1 or sum(colw) + gap * (len(colw) - 1) <= term_cols:
+            return nrows, colw
+    return n, [max(widths)]
+
+
+def suggest_from_history(history, text):
+    """Fish-style inline suggestion: rest of the newest history entry that starts with text."""
+    if not text or text.isspace():
+        return ''
+    for cmd in reversed(history):
+        if len(cmd) > len(text) and cmd.startswith(text):
+            return cmd[len(text):]
+    return ''
+
+
+def fmt_elapsed(s):
+    if s < 60: return f"{s:.1f}s"
+    return f"{int(s // 60)}m {s % 60:.0f}s"
+
+
+# --- ripple maths -----------------------------------------------------------
+def ripple_params(t, dur, max_r):
+    """Wavefront radius and brightness envelope t seconds after spawn.
+    Fast ease-out expansion, quick fade-in, long soft fade-out."""
+    p = min(1.0, max(0.0, t / dur))
+    r = max_r * 1.06 * (1.0 - (1.0 - p) ** 2.6)
+    env = min(1.0, t / 0.045) * (1.0 - p) ** 1.45
+    return r, env, p
+
+def ring_stops(R, tail, lead):
+    """Radial-gradient stops (position 0..1, strength 0..1) for a ring whose crest is at
+    radius R: soft glow behind the crest (tail px), a bright crest, a short soft lead."""
+    Rg = R + lead
+    pts = ((R - tail, 0.0), (R - tail * 0.60, 0.04), (R - tail * 0.25, 0.16),
+           (R - 2.0, 0.55), (R, 1.0), (Rg, 0.0))
+    return Rg, [(min(1.0, max(0.0, d / Rg)), a) for d, a in pts]
+
+def dot_level(d, R, band):
+    """How strongly a lattice dot at distance d from the origin lights up (0..1)."""
+    u = (d - (R - 0.35 * band)) / (0.5 * band)
+    return math.exp(-u * u)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,6 +247,10 @@ class TitleBar(QWidget):
         self.btn_close = WinButton('close', win.close)
         lay.addWidget(self.btn_min); lay.addWidget(self.btn_max); lay.addWidget(self.btn_close)
     def set_cwd(self, path): self.cwd_label.setText(path)
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(14, self.height() - 1, max(0, self.width() - 28), 1, QColor(255, 255, 255, 14))
+        p.end()
     def _toggle_max(self):
         self._win.showNormal() if self._win.isMaximized() else self._win.showMaximized()
         self.btn_max.update()
@@ -157,132 +270,269 @@ class TitleBar(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Voxel ripple — perfectly unified, subtle, faster
+#  Window surface — gradient body, corner glows, hairline border
 # ─────────────────────────────────────────────────────────────
-class VoxelRipple(QWidget):
-    BLUR_SCALE      = 2
-    WAKE_DECAY      = 0.45
-    WAKE_STRENGTH   = 0.12  # Much dimmer
-    EDGE_SHARPNESS  = 1.4
-    EDGE_BOOST      = 0.20  # Much dimmer
-    WAVE_VARIANCE   = 0.10
-    TRAVEL_DIM      = 0.72
-    FADE_RATE       = 0.09
+class Surface(QWidget):
+    def __init__(self, radius=12, parent=None):
+        super().__init__(parent)
+        self._radius = radius
+
+    def set_radius(self, r):
+        self._radius = r
+        self.update()
+
+    def paintEvent(self, ev):
+        w, h = self.width(), self.height()
+        r = float(self._radius)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, w, h), r, r)
+
+        base = QLinearGradient(0, 0, 0, h)
+        base.setColorAt(0.0, QColor(14, 17, 21))
+        base.setColorAt(1.0, QColor(7, 8, 10))
+        p.fillPath(path, QBrush(base))
+
+        glow = QRadialGradient(QPointF(w * 0.12, -h * 0.05), w * 0.65)
+        glow.setColorAt(0.0, QColor(*TEAL, 26))
+        glow.setColorAt(1.0, QColor(*TEAL, 0))
+        p.fillPath(path, QBrush(glow))
+
+        glow2 = QRadialGradient(QPointF(w * 0.95, h * 1.02), w * 0.55)
+        glow2.setColorAt(0.0, QColor(*VIOLET, 24))
+        glow2.setColorAt(1.0, QColor(*VIOLET, 0))
+        p.fillPath(path, QBrush(glow2))
+
+        if r > 0:   # hairline edge, teal → neutral → violet
+            edge = QLinearGradient(0, 0, w, h)
+            edge.setColorAt(0.0, QColor(*TEAL, 90))
+            edge.setColorAt(0.5, QColor(255, 255, 255, 22))
+            edge.setColorAt(1.0, QColor(*VIOLET, 90))
+            p.setPen(QPen(QBrush(edge), 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), r - 0.5, r - 0.5)
+        p.end()
+
+
+# ─────────────────────────────────────────────────────────────
+#  Shock ripple
+#  A thin bright crest with a soft glow behind it, a violet echo
+#  ring, a bloom at the origin, and a dot lattice that lights up
+#  as the front passes.  Time-based (not frame-based), additive
+#  light blending, several waves can overlap.
+# ─────────────────────────────────────────────────────────────
+class ShockRipple(QWidget):
+    SPACING   = 18     # dot lattice pitch in px
+    MAX_WAVES = 3
+    GLOW      = 0.75   # strength of the soft glow behind the crest
+    CREST     = (190, 255, 248)
+    ECHO_BODY = VIOLET
+    ECHO_CREST = (170, 150, 255)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAutoFillBackground(False)
-        self._active = False; self._origin = QPointF(0, 0)
-        self._radius = 0.0; self._max_r = 1000.0
-        self._life = 1.0; self._travel_life = 1.0
-        self._cell = 10; self._speed = 20.0
-        self._color = QColor(0, 235, 215)
+        self._waves = []
         self._clip_radius = 12
-        self._t = QTimer(self); self._t.timeout.connect(self._step)
+        self._brushes = {}
+        self._t = QTimer(self)
+        self._t.setTimerType(Qt.TimerType.PreciseTimer)
+        self._t.timeout.connect(self._step)
 
     def set_clip_radius(self, r):
         self._clip_radius = max(0, int(r))
         self.update()
 
-    def spawn(self, x, y, cell, color=(0, 235, 215)):
-        self._origin = QPointF(x, y); self._radius = 0.0
-        self._cell = max(6, int(cell))
+    def spawn(self, x, y, color=TEAL, strength=1.0):
         w, h = max(1, self.width()), max(1, self.height())
-        self._max_r = max(math.hypot(cx-x, cy-y)
-                          for cx, cy in [(0,0),(w,0),(0,h),(w,h)])
-        # Much faster expansion
-        self._speed = max(22.0, self._max_r / 28.0)
-        self._life = 1.0; self._travel_life = 1.0
-        self._color = QColor(*color); self._active = True
-        if not self._t.isActive(): self._t.start(16)
+        max_r = max(math.hypot(cx - x, cy - y) for cx, cy in ((0, 0), (w, 0), (0, h), (w, h)))
+        dur = min(1.7, max(0.85, 0.55 + max_r / 1100.0))
+        lift = tuple(int(c * 0.65 + 255 * 0.35) for c in color)      # dots: lighter than the ring
+        self._waves.append({"x": x, "y": y, "c": tuple(color), "dot": lift, "s": strength,
+                            "t0": time.perf_counter(), "max_r": max_r, "dur": dur})
+        del self._waves[:-self.MAX_WAVES]
+        if not self._t.isActive():
+            self._t.start(16)
         self.update()
 
     def _step(self):
-        if not self._active: self._t.stop(); return
-        self._radius += self._speed
-        progress = min(1.0, self._radius / self._max_r)
-        self._travel_life = max(0.20, 1.0 - progress * self.TRAVEL_DIM)
-        if self._radius >= self._max_r:
-            self._life -= self.FADE_RATE
-        if self._life <= 0.02:
-            self._active = False; self._t.stop()
+        now = time.perf_counter()
+        self._waves = [w for w in self._waves if now - w["t0"] < w["dur"]]
+        if not self._waves:
+            self._t.stop()
         self.update()
 
+    # --- painting ---------------------------------------------------------
     def paintEvent(self, ev):
-        if not self._active: return
-        s = self.BLUR_SCALE
-        iw, ih = max(1, self.width()//s), max(1, self.height()//s)
-        r = self._radius / s
-        if r < 1.0: return
-        img = QImage(iw, ih, QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(Qt.GlobalColor.transparent)
+        if not self._waves:
+            return
+        now = time.perf_counter()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._clip_radius > 0:
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(self.rect()), self._clip_radius, self._clip_radius)
+            p.setClipPath(clip)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)   # light adds up
+        p.setPen(Qt.PenStyle.NoPen)
+        for w in self._waves:
+            self._paint_wave(p, w, now - w["t0"])
+        p.end()
 
-        cs = max(1.0, self._cell/s); cs_int = max(1, int(math.ceil(cs)))
-        ox, oy = self._origin.x()/s, self._origin.y()/s
-        r_sq = r * r
-        life = self._life * self._travel_life
-        cr, cg, cb = self._color.red(), self._color.green(), self._color.blue()
-        wake_decay = max(r * self.WAKE_DECAY, 1.0)
-        inv_decay = 1.0 / wake_decay
-        edge_w = cs * self.EDGE_SHARPNESS
-        inv_edge_sq = 1.0 / max(edge_w * edge_w, 1.0)
-        var = self.WAVE_VARIANCE; var_half = var * 0.5
+    def _paint_wave(self, p, w, t):
+        x, y, s = w["x"], w["y"], w["s"]
+        R, env, prog = ripple_params(t, w["dur"], w["max_r"])
+        a = env * s
+        if R < 1.0 or a < 0.01:
+            return
+        c = QPointF(x, y)
+        r, g, b = w["c"]
 
-        col0 = max(0, int((ox - r - cs) / cs)); col1 = min(int(iw / cs) + 1, int((ox + r + cs) / cs) + 1)
-        row0 = max(0, int((oy - r - cs) / cs)); row1 = min(int(ih / cs) + 1, int((oy + r + cs) / cs) + 1)
+        if prog < 0.3:                                   # bloom at the origin
+            k = 1.0 - prog / 0.3
+            rad = 40.0 + 90.0 * prog / 0.3
+            bloom = QRadialGradient(c, rad)
+            bloom.setColorAt(0.0, QColor(r, g, b, int(110 * k * s)))
+            bloom.setColorAt(1.0, QColor(r, g, b, 0))
+            p.setBrush(QBrush(bloom))
+            p.drawEllipse(c, rad, rad)
 
-        with QPainter(img) as ip:
-            ip.setPen(Qt.PenStyle.NoPen)
-            for row in range(row0, row1):
-                cy = row * cs + cs / 2; dy = cy - oy; dy_sq = dy * dy
-                if dy_sq >= r_sq: continue
-                dx_max = math.sqrt(r_sq - dy_sq)
-                x0 = max(col0, int((ox - dx_max) / cs)); x1 = min(col1, int((ox + dx_max) / cs) + 1)
-                for col in range(x0, x1):
-                    cx = col * cs + cs / 2; dx = cx - ox
-                    dist_sq = dx * dx + dy_sq
-                    if dist_sq > r_sq: continue
-                    dist = math.sqrt(dist_sq); behind = r - dist
-                    decay = math.exp(-behind * inv_decay)
-                    edge  = math.exp(-behind * behind * inv_edge_sq)
-                    inten = (decay * self.WAKE_STRENGTH + edge * self.EDGE_BOOST) * life
-                    if inten > 1.0: inten = 1.0
-                    h = (col * 73856093) ^ (row * 19349663)
-                    rand = (h & 0x7FFFFFFF) / 0x7FFFFFFF
-                    inten *= (1.0 - var_half + var * rand)
-                    if inten < 0.04: continue
-                    alpha = int(inten * 200)  # Softened alpha (was 250)
-                    if alpha > 255: alpha = 255
-                    ip.setBrush(QColor(cr, cg, cb, alpha))
-                    ip.drawRect(int(col*cs), int(row*cs), cs_int, cs_int)
+        te = t - 0.12                                    # delayed violet echo
+        if te > 0:
+            R2, env2, _ = ripple_params(te, w["dur"], w["max_r"])
+            self._ring(p, c, R2, env2 * s * 0.5, self.ECHO_BODY, self.ECHO_CREST)
 
-        with QPainter(self) as p:
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            if self._clip_radius > 0:
-                path = QPainterPath()
-                path.addRoundedRect(QRectF(self.rect()), self._clip_radius, self._clip_radius)
-                p.setClipPath(path)
-            p.drawImage(self.rect(), img)
+        self._ring(p, c, R, a, (r, g, b), self.CREST)
+        if R > 24:
+            self._dots(p, x, y, R, a, w["dot"])
+
+    def _ring(self, p, c, R, a, body, crest):
+        if R < 1.0 or a < 0.01:
+            return
+        tail = 0.20 * R + 22.0
+        lead = 5.0 + 0.01 * R
+        Rg, stops = ring_stops(R, tail, lead)
+        grad = QRadialGradient(c, Rg)
+        for pos, st in stops:
+            mix = st * st
+            col = tuple(int(body[i] + (crest[i] - body[i]) * mix) for i in range(3))
+            alpha = int(255 * min(1.0, st * a * self.GLOW))
+            grad.setColorAt(pos, QColor(col[0], col[1], col[2], alpha))
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        path.addEllipse(c, Rg, Rg)
+        inner = R - tail
+        if inner > 0:
+            path.addEllipse(c, inner, inner)
+        p.fillPath(path, QBrush(grad))
+
+        p.setPen(QPen(QColor(crest[0], crest[1], crest[2], int(255 * min(1.0, a * 0.75))), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(c, R, R)
+        p.setPen(Qt.PenStyle.NoPen)
+
+    def _brush(self, color, level):
+        key = (color, level)
+        b = self._brushes.get(key)
+        if b is None:
+            b = QBrush(QColor(color[0], color[1], color[2], int(235 * level / 15)))
+            self._brushes[key] = b
+        return b
+
+    def _dots(self, p, x, y, R, a, color):
+        sp = self.SPACING
+        band = 0.14 * R + 30.0
+        outer = R + 8.0
+        inner = max(0.0, R - band * 1.4)
+        w, h = self.width(), self.height()
+        row0 = max(0, int((y - outer) // sp))
+        row1 = min(int(h // sp), int((y + outer) // sp))
+        for row in range(row0, row1 + 1):
+            cy = row * sp + sp / 2.0
+            dy = cy - y
+            ady = abs(dy)
+            if ady > outer:
+                continue
+            xo = math.sqrt(outer * outer - dy * dy)
+            if ady < inner:
+                xi = math.sqrt(inner * inner - dy * dy)
+                spans = ((x - xo, x - xi), (x + xi, x + xo))
+            else:
+                spans = ((x - xo, x + xo),)
+            for lo, hi in spans:
+                c0 = max(0, int(lo // sp))
+                c1 = min(int(w // sp), int(hi // sp))
+                for col in range(c0, c1 + 1):
+                    cx = col * sp + sp / 2.0
+                    d = math.hypot(cx - x, dy)
+                    i = dot_level(d, R, band) * a
+                    if i < 0.06:
+                        continue
+                    p.setBrush(self._brush(color, min(15, int(i * 16))))
+                    rad = 0.9 + 1.9 * i
+                    p.drawEllipse(QPointF(cx, cy), rad, rad)
 
 
 # ─────────────────────────────────────────────────────────────
-#  Glow input
+#  Glow input — soft field, gradient focus border, ghost suggestion
 # ─────────────────────────────────────────────────────────────
 class GlowInput(QLineEdit):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._phase = 0.0
-        self._t = QTimer(self); self._t.timeout.connect(self._tick); self._t.start(40)
+        self._ghost = ""
+        self._t = QTimer(self); self._t.timeout.connect(self._tick)   # only runs while focused
+
+    def ghost(self): return self._ghost
+    def set_ghost(self, s):
+        if s != self._ghost:
+            self._ghost = s; self.update()
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e); self._t.start(40)
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e); self._t.stop(); self.update()
+
     def _tick(self):
-        self._phase = (self._phase + 0.08) % (6.2831*2); self.update()
+        self._phase = (self._phase + 0.08) % (6.2831 * 2); self.update()
+
     def paintEvent(self, ev):
-        super().paintEvent(ev)
-        if not self.hasFocus(): return
+        focus = self.hasFocus()
+        box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        alpha = int(45 + 30*(0.5 + 0.5*math.sin(self._phase)))
-        p.setPen(QPen(QColor(0,220,210,alpha), 1.0)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5,0.5,-0.5,-0.5), 4, 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 11 if focus else 6))       # soft field behind the text
+        p.drawRoundedRect(box, 6, 6)
+        p.end()
+
+        super().paintEvent(ev)
+
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if focus:
+            k = 0.5 + 0.5 * math.sin(self._phase)
+            g = QLinearGradient(0, 0, self.width(), 0)
+            g.setColorAt(0.0, QColor(*TEAL, int(80 + 60 * k)))
+            g.setColorAt(1.0, QColor(*VIOLET, int(60 + 50 * (1 - k))))
+            p.setPen(QPen(QBrush(g), 1.0))
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
+        p.drawRoundedRect(box, 6, 6)
+
+        if focus and self._ghost and self.cursorPosition() == len(self.text()) \
+                and not self.hasSelectedText():
+            fm = self.fontMetrics()
+            cr = self.cursorRect()
+            x = cr.x() + 1
+            room = self.width() - x - 10
+            if room > 12:
+                p.setFont(self.font())
+                p.setPen(QColor(150, 170, 185, 95))
+                p.drawText(QPointF(x, cr.y() + fm.ascent()),
+                           fm.elidedText(self._ghost, Qt.TextElideMode.ElideRight, room))
+        p.end()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -331,67 +581,201 @@ class ProgressGroup(QObject):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Shell worker
+#  Shell worker — streams raw chunks (prompts without newline,
+#  \r progress bars), accepts stdin, kills the whole process tree
 # ─────────────────────────────────────────────────────────────
 class ShellWorker(QThread):
-    line = pyqtSignal(str); done = pyqtSignal(int)
+    chunk = pyqtSignal(str); done = pyqtSignal(int)
+
     def __init__(self, cmd, cwd=None, env=None):
         super().__init__(); self.cmd, self.cwd, self.env = cmd, cwd, env
         self.proc = None; self._killed = False
+        self._pending = []; self._lock = threading.Lock()   # input typed before the process exists
+        self._dec = codecs.getincrementaldecoder('utf-8')(errors='strict')
+        self._fallback = 'latin-1'
+        if os.name == 'nt':                       # cmd.exe & friends talk in the OEM code page
+            try:
+                import ctypes
+                self._fallback = 'cp%d' % ctypes.windll.kernel32.GetOEMCP()
+            except Exception:
+                self._fallback = 'cp850'
+
+    def _decode(self, data):
+        try:
+            return self._dec.decode(data)
+        except UnicodeDecodeError:
+            self._dec.reset()
+            return data.decode(self._fallback, errors='replace')
+
     def run(self):
         try:
-            self.proc = subprocess.Popen(
-                self.cmd, shell=True, cwd=self.cwd, env=self.env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, errors='replace')
-            for ln in self.proc.stdout:
-                if self._killed: break
-                self.line.emit(ln.rstrip("\r\n"))
+            kw = dict(shell=True, cwd=self.cwd, env=self.env, bufsize=0,
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if os.name == 'nt':
+                kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+            else:
+                kw['start_new_session'] = True    # own process group, so Ctrl+C reaches children
+            self.proc = subprocess.Popen(self.cmd, **kw)
+            with self._lock:
+                early, self._pending = self._pending, None
+            for line in early: self.send(line)
+            fd = self.proc.stdout.fileno()
+            while True:
+                data = os.read(fd, 8192)
+                if not data or self._killed:
+                    break
+                text = self._decode(data)
+                if text:
+                    self.chunk.emit(text)
             self.proc.wait()
             self.done.emit(130 if self._killed else self.proc.returncode)
         except Exception as e:
-            self.line.emit(f"[error] {e}"); self.done.emit(1)
+            self.chunk.emit(f"[error] {e}\n"); self.done.emit(1)
+
+    def send(self, text):
+        with self._lock:
+            if self._pending is not None:
+                self._pending.append(text); return
+        p = self.proc
+        if p and p.stdin and not p.stdin.closed:
+            try: p.stdin.write((text + "\n").encode('utf-8', 'replace'))
+            except Exception: pass
+
+    def close_stdin(self):
+        p = self.proc
+        if p and p.stdin and not p.stdin.closed:
+            try: p.stdin.close()
+            except Exception: pass
+
     def kill(self):
         self._killed = True
-        if self.proc:
-            try: self.proc.terminate()
+        p = self.proc
+        if not p or p.poll() is not None: return
+        try:
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception:
+            try: p.kill()
             except Exception: pass
 
 
 # ─────────────────────────────────────────────────────────────
-#  Typewriter (no outline)
+#  Typewriter
+#  - queue of (text, style) runs, no per-character tuples
+#  - \r overwrites the current line (progress bars)
+#  - follows new output only while you are at the bottom
+#  - scrollback is capped
+#  - timer only runs while there is something to type
 # ─────────────────────────────────────────────────────────────
 class Typewriter:
-    def __init__(self, te: QTextEdit):
-        self.te = te; self._q = []
-        self._t = QTimer(); self._t.timeout.connect(self._tick); self._t.start(8)
-    def write(self, text, color="#b8c8d4"):
-        for c in text: self._q.append((c, color))
-    def write_ansi(self, text, default_color="#b8c8d4"):
-        for chunk, color in parse_ansi(text, default_color):
-            for c in chunk: self._q.append((c, color))
+    DEFAULT = "#b8c8d4"
+
+    def __init__(self, te: QTextEdit, max_blocks=8000):
+        self.te = te
+        self._q = deque(); self._n = 0
+        self._fmts = {}
+        self._cr = False
+        self._last = "\n"
+        self._follow = True; self._auto = False
+        self.ansi = AnsiStream(self.DEFAULT)
+        te.setUndoRedoEnabled(False)
+        te.document().setMaximumBlockCount(max_blocks)
+        te.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._t = QTimer(); self._t.timeout.connect(self._tick)
+
+    # --- public API ---
+    def write(self, text, color=DEFAULT, bold=False, underline=False):
+        self._enqueue(text, (color, bold, underline))
+
+    def write_ansi(self, text):
+        for chunk, style in self.ansi.feed(text):
+            self._enqueue(chunk, style)
+
+    def ensure_newline(self):
+        if self._last != "\n":
+            self.write("\n")
+
+    def follow(self):
+        self._follow = True; self._scroll_bottom()
+
+    def discard(self):
+        self._q.clear(); self._n = 0; self._cr = False; self._last = "\n"
+        self.follow()
+
+    # --- internals ---
+    def _enqueue(self, text, style):
+        if not text: return
+        self._q.append((text, style)); self._n += len(text); self._last = text[-1]
+        if not self._t.isActive(): self._t.start(8)
+
+    def _on_scroll(self, v):
+        if not self._auto:
+            self._follow = v >= self.te.verticalScrollBar().maximum() - 4
+
+    def _scroll_bottom(self):
+        sb = self.te.verticalScrollBar()
+        self._auto = True; sb.setValue(sb.maximum()); self._auto = False
+
+    def _settle(self):
+        if self._follow: self._scroll_bottom()
+
     def _tick(self):
-        n = len(self._q)
-        if n == 0: return
+        n = self._n
+        if n == 0:
+            self._t.stop(); return
         if   n > 4000: batch = n
         elif n > 800:  batch = 500
         elif n > 200:  batch = 60
         elif n > 50:   batch = 8
         else:          batch = 2
         self._insert(batch)
+        if self._n == 0:
+            QTimer.singleShot(0, self._settle)     # layout is final now
+
+    def _take(self, n):
+        out = []
+        while n > 0 and self._q:
+            text, style = self._q[0]
+            if len(text) <= n:
+                self._q.popleft(); out.append((text, style)); n -= len(text); self._n -= len(text)
+            else:
+                out.append((text[:n], style)); self._q[0] = (text[n:], style)
+                self._n -= n; n = 0
+        return out
+
+    def _fmt(self, style):
+        f = self._fmts.get(style)
+        if f is None:
+            color, bold, underline = style
+            f = QTextCharFormat(); f.setForeground(QColor(color))
+            if bold: f.setFontWeight(700)
+            if underline: f.setFontUnderline(True)
+            self._fmts[style] = f
+        return f
+
     def _insert(self, batch):
-        runs = []
-        for _ in range(min(batch, len(self._q))):
-            ch, color = self._q.pop(0)
-            if runs and runs[-1][1] == color: runs[-1][0] += ch
-            else: runs.append([ch, color])
-        cursor = self.te.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        for text, color in runs:
-            fmt = QTextCharFormat()
-            fmt.setForeground(QColor(color))
-            cursor.insertText(text, fmt)
-        self.te.setTextCursor(cursor); self.te.ensureCursorVisible()
+        runs = self._take(batch)
+        if not runs: return
+        cur = QTextCursor(self.te.document())     # private cursor: never touches the user's selection
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.beginEditBlock()
+        for text, style in runs:
+            fmt = self._fmt(style)
+            for i, part in enumerate(text.split('\r')):
+                if i: self._cr = True
+                if not part: continue
+                if self._cr:
+                    self._cr = False
+                    if part[0] != '\n':           # lone \r: rewrite the current line
+                        cur.movePosition(QTextCursor.MoveOperation.StartOfBlock,
+                                         QTextCursor.MoveMode.KeepAnchor)
+                        cur.removeSelectedText()
+                cur.insertText(part, fmt)
+        cur.endEditBlock()
+        if self._follow: self._scroll_bottom()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -402,11 +786,24 @@ class FancyTerminal(QWidget):
     RADIUS = 12
     KNOWN_CMDS = ["help","clear","exit","demo","cd","pwd","history",
                   "echo","alias","export","unset"]
+    LINUX_CMDS = ("ls","cat","touch","mkdir","rmdir","rm","cp","mv","which","type","whoami",
+                  "uname","env","date","df","du","head","tail","wc","grep","find","tree")
+    WIN_CMDS   = ("dir","copy","del","cls","ren","rename","md","rd","set","start","ver","vol",
+                  "move","title","color","path","pushd","popd","mklink","assoc")
+    HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".fancy_terminal_history")
+    HISTORY_MAX  = 2000
+    PLACEHOLDER  = "type a command..."
+    RUNNING_HINT = "running · Enter sends input · Ctrl+C stops · Ctrl+D closes stdin"
+    INPUT_OK, INPUT_BAD = "#d0dde6", "#e8808e"
+    SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _FILTER_TYPES = {QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+                     QEvent.Type.Resize, QEvent.Type.KeyPress}
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fancy Terminal")
-        # NoDropShadowWindowHint prevents the Windows 11 1px border outline
+        # NoDropShadowWindowHint prevents the Windows 11 1px border outline;
+        # the soft shadow is painted by hand in paintEvent instead.
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(1000, 700)
@@ -419,17 +816,31 @@ class FancyTerminal(QWidget):
         self._prev_cwd = None
         self._aliases = {'ll': 'ls -la', 'la': 'ls -a', 'l': 'ls'}
         self._env = dict(os.environ)
+        # children are piped, not a tty: ask them to flush immediately, speak UTF-8 and keep colours
+        for k, v in (("PYTHONUNBUFFERED", "1"), ("PYTHONUTF8", "1"), ("PYTHONIOENCODING", "utf-8"),
+                     ("FORCE_COLOR", "1"), ("CLICOLOR_FORCE", "1"), ("PY_COLORS", "1")):
+            self._env.setdefault(k, v)
         self._path_cache = None
+        self._which_cache = {}
         self._cmd_start = None
         self._search_matches = None
         self._search_idx = 0
+        self._font_size = 11
+        self._busy = False
+        self._input_bad = False
+        self._spin_i = 0
+        self._hist_prefix = None
+        self._nav = False                 # True while Up/Down is filling the input
+        self.worker = None
+        self._history = self._load_history()
+        self._hist_idx = len(self._history)
 
         self._outer = QVBoxLayout(self)
         self._outer.setContentsMargins(self.RESIZE_MARGIN, self.RESIZE_MARGIN,
                                        self.RESIZE_MARGIN, self.RESIZE_MARGIN)
         self._outer.setSpacing(0)
 
-        self._container = QWidget(); self._container.setObjectName("container")
+        self._container = Surface(self.RADIUS); self._container.setObjectName("container")
         self._container.setMouseTracking(True)
         self._outer.addWidget(self._container)
         inner = QVBoxLayout(self._container)
@@ -445,22 +856,23 @@ class FancyTerminal(QWidget):
 
         # Output — transparent
         self.out = QTextEdit(); self.out.setReadOnly(True)
-        self.out.setFont(QFont("Consolas", 11))
         self.out.setStyleSheet("""
             QTextEdit {
                 background: transparent;
                 color: #c8d8e4;
                 border: none;
                 padding: 4px 2px;
+                selection-background-color: rgba(0, 217, 200, 70);
+                selection-color: #ffffff;
             }
             QScrollBar:vertical { background:transparent; width:8px; border:none; margin:0; }
-            QScrollBar::handle:vertical { background: rgba(40, 48, 58, 180); min-height:24px; border-radius:4px; }
-            QScrollBar::handle:vertical:hover { background: rgba(58, 70, 84, 220); }
+            QScrollBar::handle:vertical { background: rgba(70, 84, 98, 150); min-height:24px; border-radius:4px; }
+            QScrollBar::handle:vertical:hover { background: rgba(0, 217, 200, 140); }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; background:none; border:none; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:none; }
             QScrollBar:horizontal { background:transparent; height:8px; border:none; margin:0; }
-            QScrollBar::handle:horizontal { background: rgba(40, 48, 58, 180); min-width:24px; border-radius:4px; }
-            QScrollBar::handle:horizontal:hover { background: rgba(58, 70, 84, 220); }
+            QScrollBar::handle:horizontal { background: rgba(70, 84, 98, 150); min-width:24px; border-radius:4px; }
+            QScrollBar::handle:horizontal:hover { background: rgba(0, 217, 200, 140); }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; background:none; border:none; }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:none; }
         """)
@@ -471,27 +883,20 @@ class FancyTerminal(QWidget):
         self.progress = ProgressGroup(self.prog_box)
 
         irow = QHBoxLayout(); irow.setSpacing(6)
-        prompt = QLabel("λ")
-        prompt.setStyleSheet("color:#00d9c8; font-family:Consolas; font-size:14px; background:transparent;")
-        prompt.setFixedWidth(14)
-        self.input = GlowInput(); self.input.setFont(QFont("Consolas", 12))
-        self.input.setPlaceholderText("type a command...")
-        self.input.setStyleSheet("""
-            QLineEdit {
-                background: transparent;
-                color: #d0dde6;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 8px;
-                selection-background-color: #00d9c8; selection-color: #08090c;
-            }
-        """)
+        self.prompt = QLabel("λ")
+        self.prompt.setStyleSheet(self._prompt_css("#00d9c8"))
+        self.prompt.setFixedWidth(14)
+        self.input = GlowInput()
+        self.input.setPlaceholderText(self.PLACEHOLDER)
+        self.input.setStyleSheet(self._input_css(self.INPUT_OK))
         self.input.returnPressed.connect(self._submit)
+        self.input.textChanged.connect(self._on_input_changed)
+        self.input.textEdited.connect(self._on_input_edited)
         self.input.installEventFilter(self)
-        irow.addWidget(prompt); irow.addWidget(self.input)
+        irow.addWidget(self.prompt); irow.addWidget(self.input)
         c.addLayout(irow)
 
-        self.wave = VoxelRipple(self._container)
+        self.wave = ShockRipple(self._container)
         self.wave.setGeometry(self._container.rect())
         self.wave.set_clip_radius(self.RADIUS)
         self.wave.lower()
@@ -499,23 +904,216 @@ class FancyTerminal(QWidget):
 
         self.setStyleSheet("QLabel { color:#b8c8d4; background:transparent; }")
         self.tw = Typewriter(self.out)
-        self._history = []; self._hist_idx = 0
-        self.worker = None
+        self._spin_t = QTimer(self); self._spin_t.timeout.connect(self._spin_tick)
 
+        self._apply_fonts()
+        self._reset_output()
         self._update_cwd_label()
         self.input.setFocus()
-
-        cur = self.out.textCursor(); cur.movePosition(QTextCursor.MoveOperation.End)
-        fmt = QTextCharFormat(); fmt.setForeground(QColor("#00d9c8"))
-        cur.insertText(ASCII_LOGO + "\n\n", fmt)
-        self.out.setTextCursor(cur)
-
+        self._insert_logo()
         self._write_welcome()
         self._apply_shape()
 
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        QTimer.singleShot(60, lambda: self._complete_command(""))     # warm the PATH cache
+
+    # --- look & feel helpers ---
+    @staticmethod
+    def _mono(size):
+        f = QFont()
+        f.setFamilies(["Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas",
+                       "DejaVu Sans Mono", "Menlo", "Monospace"])
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        f.setPointSize(size)
+        return f
+
+    def _apply_fonts(self):
+        self.out.setFont(self._mono(self._font_size))
+        self.input.setFont(self._mono(self._font_size + 1))
+        self.out.setTabStopDistance(self.out.fontMetrics().horizontalAdvance(' ') * 8)
+
+    def _zoom(self, delta):
+        self._font_size = 11 if delta == 0 else max(8, min(24, self._font_size + delta))
+        self._apply_fonts()
+
+    def _reset_output(self):
+        """Clear the output and re-apply the line spacing (a cleared document forgets it)."""
+        self.out.clear()
+        try:
+            cur = QTextCursor(self.out.document())
+            bf = QTextBlockFormat()
+            bf.setLineHeight(116.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+            cur.setBlockFormat(bf)
+        except Exception:
+            pass
+
+    def _insert_logo(self):
+        """Logo with a teal → violet gradient across the columns."""
+        cur = QTextCursor(self.out.document())
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        lines = ASCII_LOGO.split("\n")
+        width = max(len(l) for l in lines)
+        for li, line in enumerate(lines):
+            for ci, ch in enumerate(line):
+                fmt = QTextCharFormat()
+                t = min(1.0, ci / max(1, width - 1) * 0.9 + li * 0.05)
+                fmt.setForeground(QColor(*_lerp_rgb(TEAL, VIOLET, t)))
+                cur.insertText(ch, fmt)
+            cur.insertText("\n")
+        cur.insertText("\n")
+
+    @staticmethod
+    def _prompt_css(color):
+        return f"color:{color}; font-family:Consolas; font-size:14px; background:transparent;"
+
+    @staticmethod
+    def _input_css(color):
+        return ("QLineEdit { background: transparent; color:%s; border: none; border-radius: 4px;"
+                " padding: 8px 8px; selection-background-color: #00d9c8; selection-color: #08090c; }" % color)
+
+    def _short_cwd(self):
+        home = os.path.expanduser("~"); p = self._cwd
+        if p == home: p = "~"
+        elif p.startswith(home + os.sep): p = "~" + p[len(home):]
+        return p.replace(os.sep, "/")
+
+    # --- history ---
+    def _load_history(self):
+        try:
+            with open(self.HISTORY_FILE, 'r', encoding='utf-8', errors='replace') as fh:
+                return [l.rstrip('\n') for l in fh if l.strip()][-self.HISTORY_MAX:]
+        except OSError:
+            return []
+
+    def _remember(self, cmd):
+        if not self._history or self._history[-1] != cmd:
+            self._history.append(cmd)
+            try:
+                with open(self.HISTORY_FILE, 'a', encoding='utf-8') as fh:
+                    fh.write(cmd + "\n")
+            except OSError:
+                pass
+        self._hist_idx = len(self._history)
+        self._hist_prefix = None
+
+    def _history_step(self, d):
+        """Up/Down: walk history entries that start with what you had typed (zsh/fish style)."""
+        h = self._history
+        if not h: return
+        if self._hist_prefix is None:
+            self._hist_prefix = self.input.text()
+            self._hist_idx = len(h)
+        pre, cur_text = self._hist_prefix, self.input.text()
+        i = self._hist_idx + d
+        while 0 <= i < len(h) and (not h[i].startswith(pre) or h[i] == cur_text):
+            i += d
+        if i < 0:
+            return
+        self._nav = True
+        try:
+            if i >= len(h):
+                self._hist_idx = len(h)
+                self.input.setText(pre)
+            else:
+                self._hist_idx = i
+                self.input.setText(h[i])
+            self.input.end(False)
+        finally:
+            self._nav = False
+
+    # --- input reactions ---
+    def _on_input_edited(self, text):
+        self._hist_prefix = None
+        self._hist_idx = len(self._history)
+
+    def _on_input_changed(self, text):
+        try:
+            self.input.set_ghost("" if self._nav else suggest_from_history(self._history, text))
+            bad = self._command_unknown(text)
+            if bad != self._input_bad:
+                self._input_bad = bad
+                self.input.setStyleSheet(self._input_css(self.INPUT_BAD if bad else self.INPUT_OK))
+        except Exception:
+            pass
+
+    def _command_unknown(self, text):
+        t = text.lstrip()
+        if not t: return False
+        first = t.split(None, 1)[0]
+        if first[0] in "!-" or any(ch in first for ch in "/\\:.~\"'=$%"):
+            return False                                   # paths, env vars, history expansion…
+        low = first.lower()
+        if ' ' not in t:                                   # still typing the first word: prefix is enough
+            return not (self._complete_command(first)
+                        or any(a.startswith(low) for a in self._aliases)
+                        or any(c.startswith(low) for c in self.LINUX_CMDS))
+        return not self._command_exists(first)
+
+    def _command_exists(self, name):
+        low = name.lower()
+        if low in self.KNOWN_CMDS or name in self._aliases or low in self.LINUX_CMDS:
+            return True
+        if os.name == 'nt' and low in self.WIN_CMDS:
+            return True
+        r = self._which_cache.get(name)
+        if r is None:
+            r = bool(shutil.which(name)); self._which_cache[name] = r
+        return r
+
+    # --- running state ---
+    def _paint_prompt(self, ok):
+        self.prompt.setStyleSheet(self._prompt_css("#00d9c8" if ok else "#e05a6a"))
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        if busy:
+            self.prompt.setStyleSheet(self._prompt_css("#8060d0"))
+            self.input.setPlaceholderText(self.RUNNING_HINT)
+            self._spin_t.start(80)
+        else:
+            self._spin_t.stop()
+            self.prompt.setText("λ")
+            self.input.setPlaceholderText(self.PLACEHOLDER)
+
+    def _spin_tick(self):
+        self._spin_i = (self._spin_i + 1) % len(self.SPIN)
+        self.prompt.setText(self.SPIN[self._spin_i])
+
+    def _error_ripple(self):
+        if self.wave.width() <= 0: return
+        gp = self.input.mapToGlobal(QPoint(16, self.input.height() // 2))
+        lp = self.wave.mapFromGlobal(gp)
+        self.wave.spawn(lp.x(), lp.y(), color=(235, 80, 100), strength=0.7)
+
+    def closeEvent(self, ev):
+        try:
+            if self._busy and self.worker is not None:
+                self.worker.kill(); self.worker.wait(800)
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
+    # --- columns (ls, tab completion) ---
+    def _term_cols(self):
+        cw = max(1, self.out.fontMetrics().horizontalAdvance('M'))
+        return max(24, self.out.viewport().width() // cw - 2)
+
+    def _write_columns(self, items, indent=0, gap=2):
+        """items = [(label, colour)], laid out column-major like `ls`."""
+        if not items: return
+        nrows, colw = layout_columns([len(l) for l, _ in items], self._term_cols() - indent, gap)
+        ncols, pad = len(colw), ' ' * indent
+        for r in range(nrows):
+            self.tw.write(pad)
+            for c in range(ncols):
+                idx = c * nrows + r
+                if idx >= len(items): break
+                label, color = items[idx]
+                last = c == ncols - 1 or idx + nrows >= len(items)
+                self.tw.write(label if last else label.ljust(colw[c] + gap), color)
+            self.tw.write("\n")
 
     # --- system-stats helpers ---
     def _greeting(self):
@@ -525,16 +1123,18 @@ class FancyTerminal(QWidget):
         if 18 <= h < 23: return "Good evening"
         return "Working late"
 
-    @staticmethod
-    def _ascii_bar(pct, width=12):
-        if pct is None:
-            return "[" + "?" * width + "]   n/a"
+    def _write_bar(self, label, pct, width=14):
+        tw, dim = self.tw, "#3a4450"
+        tw.write(f"  {label:<9} ", color="#8fa8bc")
         try:
             p = max(0.0, min(100.0, float(pct)))
-        except Exception:
-            return "[" + "?" * width + "]   n/a"
+        except (TypeError, ValueError):
+            tw.write("[" + "·" * width + "]   n/a\n", color=dim); return
         filled = int(round(width * p / 100.0))
-        return "[" + "█" * filled + "░" * (width - filled) + f"] {p:5.1f}%"
+        col = "#00d9c8" if p < 60 else "#e0b050" if p < 85 else "#e05a6a"
+        tw.write("[", color=dim); tw.write("█" * filled, color=col)
+        tw.write("░" * (width - filled), color=dim); tw.write("]", color=dim)
+        tw.write(f" {p:5.1f}%\n", color="#8fa8bc")
 
     def _get_gpu_usage(self):
         try:
@@ -599,12 +1199,7 @@ class FancyTerminal(QWidget):
         arch = platform.machine() or "—"
         pyver = platform.python_version()
 
-        home = os.path.expanduser("~")
-        cwd = self._cwd
-        if cwd == home: cwd_disp = "~"
-        elif cwd.startswith(home): cwd_disp = "~" + cwd[len(home):]
-        else: cwd_disp = cwd
-        cwd_disp = cwd_disp.replace(os.sep, "/")
+        cwd_disp = self._short_cwd()
 
         cpu_pct = ram_pct = None
         try:
@@ -621,46 +1216,47 @@ class FancyTerminal(QWidget):
         self.tw.write(f"  {'host':<9} {host}\n", color="#8fa8bc")
         self.tw.write(f"  {'cwd':<9} {cwd_disp}\n", color="#8fa8bc")
         self.tw.write("\n", color="#6f8898")
-        self.tw.write(f"  {'cpu':<9} {self._ascii_bar(cpu_pct)}\n", color="#8fa8bc")
-        self.tw.write(f"  {'gpu':<9} {self._ascii_bar(gpu_pct)}\n", color="#8fa8bc")
-        self.tw.write(f"  {'ram':<9} {self._ascii_bar(ram_pct)}\n", color="#8fa8bc")
+        self._write_bar("cpu", cpu_pct)
+        self._write_bar("gpu", gpu_pct)
+        self._write_bar("ram", ram_pct)
         self.tw.write(f"\n  {now.strftime('%A, %B %d %Y')} · {now.strftime('%H:%M')}\n\n",
                       color="#6f8898")
-        self.tw.write("Type 'help' for commands, Tab to complete.\n\n", color="#6f8898")
+        self.tw.write("Type 'help' for commands · Tab completes · → accepts the grey suggestion.\n\n", color="#6f8898")
 
     # --- paint & shape ---
     def paintEvent(self, ev):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        maximized = self.isMaximized() or self.isFullScreen()
+        if not maximized:
+            # hand-painted soft shadow in the transparent margin
+            m = self.RESIZE_MARGIN
+            base = QRectF(self._container.geometry())
+            p.setPen(Qt.PenStyle.NoPen)
+            for i in range(m, 0, -1):
+                p.setBrush(QColor(0, 0, 0, 2 + int(5 * (1.0 - i / m))))
+                p.drawRoundedRect(base.adjusted(-i, -i + 2, i, i + 2), self.RADIUS + i, self.RADIUS + i)
+        # (almost) invisible fill so the transparent margin still receives mouse events for resizing
         path = QPainterPath()
-        if self.isMaximized() or self.isFullScreen():
+        if maximized:
             path.addRect(QRectF(self.rect()))
         else:
-            path.addRoundedRect(QRectF(self.rect()), self.RADIUS + self.RESIZE_MARGIN, self.RADIUS + self.RESIZE_MARGIN)
+            path.addRoundedRect(QRectF(self.rect()), self.RADIUS + self.RESIZE_MARGIN,
+                                self.RADIUS + self.RESIZE_MARGIN)
         p.fillPath(path, QColor(0, 0, 0, 1))
 
     def _apply_shape(self):
-        if self.isMaximized() or self.isFullScreen():
-            self._outer.setContentsMargins(0, 0, 0, 0)
-            self._container.setStyleSheet(
-                "QWidget#container { background:#0a0b0d; border:none; border-radius:0px; }")
-            if hasattr(self, "wave"):
-                self.wave.set_clip_radius(0)
-                self.wave.lower()
-        else:
-            m = self.RESIZE_MARGIN
-            self._outer.setContentsMargins(m, m, m, m)
-            self._container.setStyleSheet(
-                "QWidget#container { background:#0a0b0d; border:none; border-radius:%dpx; }" % self.RADIUS)
-            if hasattr(self, "wave"):
-                self.wave.set_clip_radius(self.RADIUS)
-                self.wave.lower()
+        maximized = self.isMaximized() or self.isFullScreen()
+        m = 0 if maximized else self.RESIZE_MARGIN
+        self._outer.setContentsMargins(m, m, m, m)
+        r = 0 if maximized else self.RADIUS
+        self._container.set_radius(r)
+        if hasattr(self, "wave"):
+            self.wave.set_clip_radius(r)
+            self.wave.lower()
 
     def _update_cwd_label(self):
-        home = os.path.expanduser("~"); p = self._cwd
-        if p == home: p = "~"
-        elif p.startswith(home): p = "~" + p[len(home):]
-        self._titlebar.set_cwd(p.replace(os.sep, '/'))
+        self._titlebar.set_cwd(self._short_cwd())
 
     def changeEvent(self, ev):
         super().changeEvent(ev)
@@ -778,7 +1374,11 @@ class FancyTerminal(QWidget):
 
     # --- keyboard / event filter ---
     def eventFilter(self, obj, ev):
-        if ev.type() == ev.Type.MouseButtonPress and isinstance(obj, QWidget):
+        t = ev.type()
+        if t not in self._FILTER_TYPES:          # app-wide filter: bail out fast for everything else
+            return False
+
+        if t == ev.Type.MouseButtonPress and isinstance(obj, QWidget):
             try:
                 if obj.window() is self and obj is not self.input and obj is not self.wave:
                     self.input.setFocus()
@@ -786,13 +1386,13 @@ class FancyTerminal(QWidget):
                 pass
 
         if obj is self._container:
-            if ev.type() == ev.Type.Resize:
+            if t == ev.Type.Resize:
                 self._sync_wave()
-            elif ev.type() == ev.Type.MouseMove and not self._resize_edge:
+            elif t == ev.Type.MouseMove and not self._resize_edge:
                 wp = self._container.mapTo(self, ev.position().toPoint())
                 e = self._edge_at(wp, expanded=True)
                 self.setCursor(self._cursor_for(e)) if e else self.unsetCursor()
-            elif (ev.type() == ev.Type.MouseButtonPress
+            elif (t == ev.Type.MouseButtonPress
                   and ev.button() == Qt.MouseButton.LeftButton
                   and not self._resize_edge):
                 wp = self._container.mapTo(self, ev.position().toPoint())
@@ -802,42 +1402,63 @@ class FancyTerminal(QWidget):
                     self._resize_start_geo = self.geometry()
                     self._resize_start_pos = ev.globalPosition().toPoint()
                     self.grabMouse(); return True
-        if obj is self.input and ev.type() == ev.Type.KeyPress:
-            ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            if ctrl and ev.key() == Qt.Key.Key_R:
-                self._reverse_search(); return True
-            self._search_matches = None
-            if ctrl and ev.key() == Qt.Key.Key_C:
-                if self.input.selectedText(): return False
-                if self.worker and self.worker.isRunning():
-                    self.worker.kill(); self.tw.write("^C\n", color="#e05a6a")
+        if obj is self.input and t == ev.Type.KeyPress:
+            if self._on_key(ev):
                 return True
-            if ctrl and ev.key() == Qt.Key.Key_L: self.out.clear(); return True
-            if ctrl and ev.key() == Qt.Key.Key_U: self.input.clear(); return True
-            if ctrl and ev.key() == Qt.Key.Key_W:
-                cur = self.input.cursorPosition(); t = self.input.text()
-                new_t = re.sub(r'\S+\s*$', '', t[:cur])
-                self.input.setText(new_t + t[cur:]); self.input.setCursorPosition(len(new_t)); return True
-            if ctrl and ev.key() == Qt.Key.Key_K:
-                self.input.setText(self.input.text()[:self.input.cursorPosition()]); return True
-            if ctrl and ev.key() == Qt.Key.Key_D:
-                if not self.input.text(): QApplication.quit()
-                return True
-            if ev.key() == Qt.Key.Key_Up:
-                if self._history:
-                    self._hist_idx = max(0, self._hist_idx - 1)
-                    self.input.setText(self._history[self._hist_idx]); self.input.end(False)
-                return True
-            if ev.key() == Qt.Key.Key_Down:
-                if self._history:
-                    self._hist_idx = min(len(self._history), self._hist_idx + 1)
-                    self.input.setText("" if self._hist_idx >= len(self._history)
-                                       else self._history[self._hist_idx])
-                    self.input.end(False)
-                return True
-            if ev.key() == Qt.Key.Key_Tab:
-                self._tab_complete(); return True
         return super().eventFilter(obj, ev)
+
+    def _on_key(self, ev):
+        """Returns True when the key was handled here."""
+        key, mods, inp = ev.key(), ev.modifiers(), self.input
+        K = Qt.Key
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        plain = not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+                             | Qt.KeyboardModifier.ShiftModifier))
+        if ctrl and key == K.Key_R:
+            self._reverse_search(); return True
+        self._search_matches = None
+
+        if ctrl and key == K.Key_C:
+            if self.out.textCursor().hasSelection():          # copy a selection from the output
+                self.out.copy(); return True
+            if inp.hasSelectedText(): return False             # normal copy inside the input
+            if self._busy and self.worker is not None:
+                self.worker.kill(); self.tw.write("^C\n", color="#e05a6a")
+            elif inp.text():
+                self.tw.write(f"{self._short_cwd()} λ {inp.text()}^C\n", color="#6f8898")
+                inp.clear()
+            return True
+        if ctrl and key == K.Key_L:
+            self.tw.discard(); self._reset_output(); return True
+        if ctrl and key == K.Key_U: inp.clear(); return True
+        if ctrl and key == K.Key_W:
+            cur = inp.cursorPosition(); t = inp.text()
+            new_t = re.sub(r'\S+\s*$', '', t[:cur])
+            inp.setText(new_t + t[cur:]); inp.setCursorPosition(len(new_t)); return True
+        if ctrl and key == K.Key_K:
+            inp.setText(inp.text()[:inp.cursorPosition()]); return True
+        if ctrl and key == K.Key_D:
+            if not inp.text():
+                if self._busy and self.worker is not None: self.worker.close_stdin()   # EOF
+                else: self.close()
+            return True
+        if ctrl and key in (K.Key_Plus, K.Key_Equal): self._zoom(+1); return True
+        if ctrl and key == K.Key_Minus:               self._zoom(-1); return True
+        if ctrl and key == K.Key_0:                   self._zoom(0);  return True
+
+        if key == K.Key_Escape and plain:
+            inp.clear(); return True
+        if key in (K.Key_PageUp, K.Key_PageDown):
+            sb = self.out.verticalScrollBar()
+            step = sb.pageStep() * (-1 if key == K.Key_PageUp else 1)
+            sb.setValue(sb.value() + step); return True
+        if key in (K.Key_Right, K.Key_End) and plain and inp.ghost() \
+                and inp.cursorPosition() == len(inp.text()) and not inp.hasSelectedText():
+            inp.setText(inp.text() + inp.ghost()); inp.end(False); return True   # accept suggestion
+        if key == K.Key_Up:   self._history_step(-1); return True
+        if key == K.Key_Down: self._history_step(+1); return True
+        if key == K.Key_Tab:  self._tab_complete();   return True
+        return False
 
     def _reverse_search(self):
         if self._search_matches is None:
@@ -870,7 +1491,7 @@ class FancyTerminal(QWidget):
         if len(common) > len(current) and common[:len(current)].lower() == current.lower():
             nb = ' '.join(parts[:-1] + [current + common[len(current):]])
             self.input.setText(nb + after); self.input.setCursorPosition(len(nb)); return
-        self.tw.write('  ' + '  '.join(candidates) + '\n', color="#8060d0")
+        self._write_columns([(c, "#8060d0") for c in candidates], indent=2)
 
     def _common_prefix_ci(self, strings):
         if not strings: return ''
@@ -949,18 +1570,26 @@ class FancyTerminal(QWidget):
 
     def _submit_impl(self):
         raw = self.input.text()
+
+        # a command is running: Enter feeds its stdin
+        if self._busy and self.worker is not None:
+            self.input.clear()
+            self.tw.write(raw + "\n", color="#8fa8bc")
+            self.worker.send(raw)
+            return
+
         if not raw.strip(): self.input.clear(); return
 
+        # ripple starts under the last word you typed
         fm = self.input.fontMetrics()
         trimmed = raw.rstrip(); sp = trimmed.rfind(' ')
         last_word = trimmed if sp == -1 else trimmed[sp+1:]
         prefix_w = 0 if sp == -1 else fm.horizontalAdvance(raw[:sp+1])
         if last_word and self.wave.width() > 0:
             wx = 8 + prefix_w; ww = fm.horizontalAdvance(last_word)
-            cell = max(8, min(16, fm.horizontalAdvance('M')))
             gp = self.input.mapToGlobal(QPoint(int(wx + ww/2), int(self.input.height()/2)))
             lp = self.wave.mapFromGlobal(gp)
-            self.wave.spawn(lp.x(), lp.y(), cell)
+            self.wave.spawn(lp.x(), lp.y())
 
         raw_cmd = self._expand_history(raw.strip())
         text = raw_cmd
@@ -969,8 +1598,11 @@ class FancyTerminal(QWidget):
             text = self._aliases[first] + text[len(first):]
 
         self.input.clear()
-        self._history.append(raw_cmd); self._hist_idx = len(self._history)
-        self.tw.write(f"λ {raw_cmd}\n", color="#00d9c8")
+        self._remember(raw_cmd)
+        self.tw.follow()
+        self.tw.write(self._short_cwd() + " ", color="#4f5a66")
+        self.tw.write("λ ", color="#00d9c8")
+        self.tw.write(raw_cmd + "\n", color="#e4eef5")
 
         if text == 'help' or text == '?':
             self.tw.write(
@@ -988,10 +1620,13 @@ class FancyTerminal(QWidget):
                 "  find [DIR] PATTERN  ·  tree [-L N] [DIR]\n"
                 "Wildcards:   ls *.py   cat *.txt\n"
                 "\n"
-                "Keys:  Tab ↑↓  Ctrl+R (reverse search)  Ctrl+C L U W K D\n\n",
+                "Keys:  Tab complete · → accept suggestion · ↑↓ history (matches what you typed)\n"
+                "       Ctrl+R search · Ctrl+C copy / stop · Ctrl+D EOF / exit · Ctrl+L clear\n"
+                "       Ctrl+U W K edit · PgUp PgDn scroll · Ctrl + − 0 zoom · Esc clear line\n"
+                "While a command runs, Enter sends a line to it.\n\n",
                 color="#6f8898")
         elif text == 'clear':
-            self.out.clear()
+            self.tw.discard(); self._reset_output()
         elif text == 'exit':
             QApplication.quit()
         elif text == 'pwd':
@@ -1083,10 +1718,55 @@ class FancyTerminal(QWidget):
         if fn is None: return False
         fn(args); return True
 
+    _EXT_ARCHIVE = {'.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar', '.zst'}
+    _EXT_MEDIA   = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico',
+                    '.mp3', '.wav', '.flac', '.ogg', '.mp4', '.mkv', '.mov', '.avi', '.webm'}
+    _EXT_EXEC    = {'.exe', '.bat', '.cmd', '.ps1', '.com', '.msi', '.sh'}
+
+    def _ls_item(self, name, full):
+        """-> (label, colour) for one directory entry."""
+        try: st = os.lstat(full)
+        except OSError: return name, "#b8c8d4"
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            return name + ('/' if os.path.isdir(full) else '@'), "#00d9c8"
+        if stat.S_ISDIR(mode):
+            return name + '/', "#5a9fd0"
+        ext = os.path.splitext(name)[1].lower()
+        if name.startswith('.'):         return name, "#6f8898"
+        if ext in self._EXT_ARCHIVE:     return name, "#e0b050"
+        if ext in self._EXT_MEDIA:       return name, "#b08cf0"
+        if ext in self._EXT_EXEC or (os.name != 'nt' and mode & 0o111):
+            return name, "#6fd68f"
+        return name, "#b8c8d4"
+
+    def _ls_long(self, path, names):
+        now = time.time()
+        for e in names:
+            full = os.path.join(path, e)
+            try: st = os.lstat(full)
+            except OSError: continue
+            label, color = self._ls_item(e, full)
+            if stat.S_ISLNK(st.st_mode) and label.endswith('@'): label = label[:-1]   # '->' says it already
+            size = '-' if stat.S_ISDIR(st.st_mode) else self._human(st.st_size)
+            try:
+                mt = datetime.datetime.fromtimestamp(st.st_mtime)
+                when = mt.strftime("%b %d %H:%M") if now - st.st_mtime < 15552000 else mt.strftime("%b %d  %Y")
+            except (OSError, OverflowError, ValueError):
+                when = "?"
+            link = ''
+            if stat.S_ISLNK(st.st_mode):
+                try: link = ' -> ' + os.readlink(full)
+                except OSError: pass
+            self.tw.write(f"{stat.filemode(st.st_mode)}  ", color="#4f5a66")
+            self.tw.write(f"{size:>6}  ", color="#8fa8bc")
+            self.tw.write(f"{when:<12}  ", color="#6f8898")
+            self.tw.write(label + link + "\n", color=color)
+
     def _cmd_ls(self, args):
         args = self._expand_globs(args)
-        show_all = any(a.startswith('-') and 'a' in a for a in args)
-        long_fmt = any(a.startswith('-') and 'l' in a for a in args)
+        flags = ''.join(a[1:] for a in args if a.startswith('-') and not a.startswith('--'))
+        show_all, long_fmt, one_col = ('a' in flags or 'A' in flags), 'l' in flags, '1' in flags
         targets = [a for a in args if not a.startswith('-')] or ['.']
         for i, t in enumerate(targets):
             path = self._resolve_path(t)
@@ -1096,23 +1776,21 @@ class FancyTerminal(QWidget):
                 self.tw.write(disp + "\n"); continue
             if not os.path.isdir(path):
                 self.tw.write(f"ls: {t}: no such file or directory\n", color="#e05a6a"); continue
-            try: entries = sorted(os.listdir(path))
+            try: entries = sorted(os.listdir(path), key=str.lower)
             except Exception as e:
                 self.tw.write(f"ls: {t}: {e}\n", color="#e05a6a"); continue
             if len(targets) > 1:
                 if i > 0: self.tw.write("\n")
-                self.tw.write(f"{t}:\n")
-            for e in entries:
-                if e.startswith('.') and not show_all: continue
-                full = os.path.join(path, e); is_dir = os.path.isdir(full)
-                color = "#5a9fd0" if is_dir else "#b8c8d4"
-                if long_fmt:
-                    try: size = 0 if is_dir else os.path.getsize(full)
-                    except OSError: size = 0
-                    perm = 'd' if is_dir else '-'
-                    self.tw.write(f"{perm}rw-r--r--  {size:>8}  {e}{'/' if is_dir else ''}\n", color=color)
+                self.tw.write(f"{t}:\n", color="#8fa8bc")
+            names = [e for e in entries if show_all or not e.startswith('.')]
+            if long_fmt:
+                self._ls_long(path, names)
+            else:
+                items = [self._ls_item(e, os.path.join(path, e)) for e in names]
+                if one_col:
+                    for label, color in items: self.tw.write(label + "\n", color=color)
                 else:
-                    self.tw.write(e + ('/' if is_dir else '') + "\n", color=color)
+                    self._write_columns(items)
         self.tw.write("\n"); return True
 
     def _cmd_cat(self, args):
@@ -1380,16 +2058,31 @@ class FancyTerminal(QWidget):
         QTimer.singleShot(1900, lambda: self.tw.write("✓ demo complete\n\n", color="#00d9c8"))
 
     def _shell(self, cmd):
+        if self.worker is not None:
+            self.worker.wait(500)                 # previous thread has fully finished before we drop it
         self._cmd_start = time.time()
+        self.tw.ansi.reset()
         self.worker = ShellWorker(cmd, cwd=self._cwd, env=self._env)
-        self.worker.line.connect(lambda l: self.tw.write_ansi(l + "\n"))
+        self.worker.chunk.connect(self.tw.write_ansi)
         self.worker.done.connect(self._on_shell_done)
+        self._set_busy(True)
         self.worker.start()
 
     def _on_shell_done(self, code):
         elapsed = time.time() - self._cmd_start if self._cmd_start else 0.0
-        color = "#00d9c8" if code == 0 else "#e05a6a"
-        self.tw.write(f"\n[exit {code}] · {elapsed:.2f}s\n\n", color=color)
+        killed = code == 130
+        self._set_busy(False)
+        self._paint_prompt(code == 0)
+        self.tw.ensure_newline()
+        if code == 0:
+            if elapsed >= 1.0:                    # quiet on fast successes
+                self.tw.write(f"✓ {fmt_elapsed(elapsed)}\n", color="#2f9d8f")
+        else:
+            label = "✗ interrupted" if killed else f"✗ exit {code}"
+            self.tw.write(f"{label} · {fmt_elapsed(elapsed)}\n", color="#e05a6a")
+            if not killed:
+                self._error_ripple()
+        self.tw.write("\n")
 
 
 def main():
